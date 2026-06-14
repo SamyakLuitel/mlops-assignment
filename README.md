@@ -104,7 +104,22 @@ Sanity-check from your laptop browser:
 
 - Langfuse → http://localhost:3001 (sign up locally, instant)
 
+
+ssh -L 4000:localhost:3000 \
+    -L 9091:localhost:9090 \
+    -L 4002:localhost:3001 \
+    -L 8003:localhost:8000 \
+    -L 8004:localhost:8001
+    user@server_host
+
+- Prometheus → http://localhost:9091
+
+- Grafana → http://localhost:4000 (admin / admin)
+
+- Langfuse → http://localhost:4002 (sign up locally, instant)
   
+  - VLLM → http://localhost:8003 (sign up locally, instant)
+
 
 If a URL doesn't load, the port forward is the most likely culprit.
 
