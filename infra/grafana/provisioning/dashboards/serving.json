@@ -2,11 +2,11 @@
   "title": "vLLM serving",
   "uid": "vllm-serving",
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "refresh": "5s",
   "tags": ["vllm", "starter"],
   "time": {
-    "from": "now-15m",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
@@ -18,137 +18,160 @@
   },
   "panels": [
     {
-      "id": 50,
+      "id": 100,
       "type": "row",
-      "title": "At a glance",
+      "title": "Latency — is the system slow, and where in the request lifecycle?",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "collapsed": false
     },
     {
-      "id": 20,
-      "type": "stat",
-      "title": "Requests running",
-      "description": "Active requests being served by vLLM right now.",
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "id": 3,
+      "type": "timeseries",
+      "title": "End-to-end request latency (p50/p95/p99)",
+      "description": "Full vLLM request latency = queue wait + TTFT + decode. The top-line 'is it slow?' signal. A single LLM call should stay well under the 5s end-to-end agent SLO.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_running" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": { "mode": "fixed", "fixedColor": "blue" }
-        },
-        "overrides": []
-      },
-      "options": {
-        "graphMode": "area",
-        "colorMode": "value",
-        "justifyMode": "center",
-        "textMode": "value",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "text": { "valueSize": 56 }
-      }
-    },
-    {
-      "id": 21,
-      "type": "stat",
-      "title": "Generated tokens / sec",
-      "description": "Output token rate produced by vLLM, smoothed over 1m.",
-      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:generation_tokens_total[1m]))" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "decimals": 0,
-          "color": { "mode": "fixed", "fixedColor": "green" }
-        },
-        "overrides": []
-      },
-      "options": {
-        "graphMode": "area",
-        "colorMode": "value",
-        "justifyMode": "center",
-        "textMode": "value",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "text": { "valueSize": 56 }
-      }
-    },
-    {
-      "id": 22,
-      "type": "stat",
-      "title": "Request latency p95",
-      "description": "95th percentile end-to-end request latency over the last minute. Should stay well under the 5s agent SLO.",
-      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))", "legendFormat": "p99" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "decimals": 2,
-          "color": { "mode": "thresholds" },
+          "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true },
           "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 5 } ] }
         },
         "overrides": []
       },
-      "options": {
-        "graphMode": "area",
-        "colorMode": "value",
-        "justifyMode": "center",
-        "textMode": "value",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "text": { "valueSize": 56 }
-      }
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
     },
     {
-      "id": 23,
-      "type": "stat",
-      "title": "KV cache used",
-      "description": "Fraction of the GPU KV-cache block pool in use. Near 100% = no headroom; vLLM starts preempting requests.",
-      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "id": 4,
+      "type": "timeseries",
+      "title": "Time to first token (p50/p95/p99)",
+      "description": "Queue wait + prompt prefill. High TTFT means the request waited to be scheduled or the prompt prefill is heavy — the front half of the lifecycle.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:gpu_cache_usage_perc" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m])))", "legendFormat": "p99" }
       ],
       "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 0,
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.95 } ] }
-        },
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
         "overrides": []
       },
-      "options": {
-        "graphMode": "area",
-        "colorMode": "value",
-        "justifyMode": "center",
-        "textMode": "value",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "text": { "valueSize": 56 }
-      }
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Queue wait time (p50/p95/p99)",
+      "description": "Time a request sat in the waiting queue before scheduling. This is the first thing to rise when you exceed serving capacity — isolates 'slow because queued' from 'slow because compute'.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Time per output token (p50/p95/p99)",
+      "description": "Decode cost per token (inter-token latency), the back half of the lifecycle. High TPOT under load = decode-bound / batch too large.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[1m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Throughput — what is the system actually pushing through?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Token throughput (prompt vs generated / sec)",
+      "description": "Prefill (prompt) vs decode (generated) token rates, smoothed over 1m. Throughput is a rate, so percentiles don't apply — the rate itself is the signal.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:generation_tokens_total[1m]))", "legendFormat": "generated tok/s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:prompt_tokens_total[1m]))", "legendFormat": "prompt tok/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Request throughput (success / sec, by finish reason)",
+      "description": "Completed requests per second, split by finish reason (stop vs length vs abort). Watch for aborts/length-caps creeping in under load.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (finished_reason) (rate(vllm:request_success_total[1m]))", "legendFormat": "{{finished_reason}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Concurrency: running vs waiting (queue depth)",
+      "description": "Requests actively decoding vs queued. waiting > 0 means you are at capacity and requests are queuing — pair this with the Queue wait latency panel above.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_running", "legendFormat": "running" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_waiting", "legendFormat": "waiting" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "overrides": []
+      },
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
     },
 
     {
       "id": 300,
       "type": "row",
-      "title": "KV cache (headroom for concurrency)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "title": "KV cache — headroom for more concurrency, or about to evict?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
       "collapsed": false
     },
     {
       "id": 10,
       "type": "timeseries",
       "title": "GPU KV-cache utilization",
-      "description": "Fraction of the GPU KV-cache block pool in use. Near 100% = no headroom; vLLM starts preempting/evicting requests.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "description": "Fraction of the GPU KV-cache block pool in use — the headroom metric. Near 100% = no room for more concurrent sequences; vLLM starts preempting/evicting requests (which shows up as queue wait and recompute).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:gpu_cache_usage_perc", "legendFormat": "KV cache used" }
@@ -169,8 +192,8 @@
       "id": 11,
       "type": "timeseries",
       "title": "Prefix cache hit rate",
-      "description": "Share of prefix-cache lookups that hit. High = repeated prompt prefixes (e.g. shared schema) reused instead of recomputed.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "description": "Share of prefix-cache lookups that hit. High = repeated prompt prefixes (e.g. shared system prompt / schema) are reused instead of recomputed, buying you effective KV headroom.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(vllm:gpu_prefix_cache_hits_total[1m]) / clamp_min(rate(vllm:gpu_prefix_cache_queries_total[1m]), 1)", "legendFormat": "hit rate" }
@@ -183,141 +206,65 @@
     },
 
     {
-      "id": 100,
+      "id": 400,
       "type": "row",
-      "title": "Latency (where is the time going?)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "title": "Overview (starter panels)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
       "collapsed": false
     },
     {
-      "id": 3,
+      "id": 1,
       "type": "timeseries",
-      "title": "End-to-end request latency (p50/p95/p99)",
-      "description": "Full vLLM request latency. A single LLM call should be well under the 5s end-to-end agent SLO.",
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 16 },
+      "title": "Requests running",
+      "description": "Active requests being served by vLLM right now.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))", "legendFormat": "p95" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))", "legendFormat": "p99" }
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "vllm:num_requests_running",
+          "legendFormat": "running"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }
+        },
         "overrides": []
       },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
     },
     {
-      "id": 4,
+      "id": 2,
       "type": "timeseries",
-      "title": "Time to first token (p50/p95/p99)",
-      "description": "Prefill + queue cost. High TTFT means the request waited or the prompt prefill is heavy.",
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 16 },
+      "title": "Generated tokens / sec",
+      "description": "Rate of output tokens produced by vLLM, smoothed over 1m.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m])))", "legendFormat": "p95" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m])))", "legendFormat": "p99" }
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(vllm:generation_tokens_total[1m])",
+          "legendFormat": "gen tokens/s"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }
+        },
         "overrides": []
       },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "Time per output token (p50/p95/p99)",
-      "description": "Decode cost per token (inter-token latency). High TPOT under load = decode-bound / batch too large.",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[1m])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[1m])))", "legendFormat": "p95" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_per_output_token_seconds_bucket[1m])))", "legendFormat": "p99" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
-        "overrides": []
-      },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "Queue wait time (p50/p95/p99)",
-      "description": "Time a request sat in the waiting queue before scheduling. Rises first when you exceed serving capacity.",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))", "legendFormat": "p95" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))", "legendFormat": "p99" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
-        "overrides": []
-      },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
-    },
-
-    {
-      "id": 200,
-      "type": "row",
-      "title": "Throughput",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
-      "collapsed": false
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "Token throughput (prompt vs generated / sec)",
-      "description": "Prefill (prompt) vs decode (generated) token rates, smoothed over 1m.",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:generation_tokens_total[1m]))", "legendFormat": "generated tok/s" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:prompt_tokens_total[1m]))", "legendFormat": "prompt tok/s" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
-        "overrides": []
-      },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
-    },
-    {
-      "id": 8,
-      "type": "timeseries",
-      "title": "Request throughput (success / sec)",
-      "description": "Completed requests per second, broken down by finish reason.",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (finished_reason) (rate(vllm:request_success_total[1m]))", "legendFormat": "{{finished_reason}}" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
-        "overrides": []
-      },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Concurrency: running vs waiting",
-      "description": "Requests actively decoding vs queued. Waiting > 0 means you are at capacity and requests are queuing.",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_running", "legendFormat": "running" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_waiting", "legendFormat": "waiting" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 3, "fillOpacity": 15, "showPoints": "never", "spanNulls": true } },
-        "overrides": []
-      },
-      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
     }
   ]
 }
