@@ -1,14 +1,20 @@
 """LangGraph agent: text-to-SQL with verify+revise loop.
 
-Graph shape:
+Graph shape (with the Phase 6 fast path):
 
-    START -> attach_schema -> generate_sql -> execute -> verify
-                                                          |
-                                              ok=true ----+----> END
-                                                          |
-                                              ok=false ---+----> revise -> execute -> verify (loop)
+    START -> attach_schema -> generate_sql -> execute -> [exec ok?]
+                                                            |
+                              exec ok --------- fast path --+----> END  (skip verify)
+                                                            |
+                              exec failed ------------------+----> verify
+                                                                     |
+                                              verify ok -------------+----> END
+                                                                     |
+                                              not ok ---------------+----> revise -> execute (loop)
 
-Loop is capped at MAX_ITERATIONS total generate/revise calls.
+The fast path serves cleanly-executing SQL with a single LLM call; the
+verify -> revise loop only runs when execution errored. Loop is capped at
+MAX_ITERATIONS total generate/revise calls.
 
 The execute node and the graph wiring are provided. `generate_sql_node` is
 filled in as a worked example; you implement `verify`, `revise`, and the
@@ -192,6 +198,25 @@ def revise_node(state: AgentState) -> dict:
     }
 
 
+def route_after_execute(state: AgentState) -> str:
+    """Fast path: if the SQL executed cleanly, serve it and skip verify.
+
+    The common case (valid SQL on the first try) becomes a single LLM call
+    instead of generate + verify, which keeps a full agent run well under the
+    5s P95 SLO and drops the in-flight concurrency at a given RPS enough to
+    fit the server's thread budget. The verify -> revise loop is preserved for
+    the error case, where it earns its keep fixing broken queries.
+
+    Two ways to end here: execution succeeded (fast path), or we are out of
+    iteration budget and there is nothing left to revise.
+    """
+    if state.execution and state.execution.ok:
+        return "end"
+    if state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "verify"
+
+
 def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
@@ -218,7 +243,11 @@ def build_graph():
     g.add_edge(START, "attach_schema")
     g.add_edge("attach_schema", "generate_sql")
     g.add_edge("generate_sql", "execute")
-    g.add_edge("execute", "verify")
+    g.add_conditional_edges(
+        "execute",
+        route_after_execute,
+        {"verify": "verify", "end": END},
+    )
     g.add_conditional_edges(
         "verify",
         route_after_verify,
