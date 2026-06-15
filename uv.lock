@@ -1694,7 +1694,6 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "tqdm" },
-    { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "vllm" },
 ]
@@ -1712,7 +1711,6 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0,<3.0" },
     { name = "python-dotenv", specifier = ">=1.0,<2.0" },
     { name = "tqdm", specifier = ">=4.66,<5.0" },
-    { name = "transformers", specifier = ">=4.56,<5" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1.0" },
     { name = "vllm", specifier = ">=0.9.0,<0.11" },
 ]

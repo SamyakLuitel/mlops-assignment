@@ -56,13 +56,93 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 # ---------- Implement these (Phase 5) ----------------------------------
 
+# Node names in the agent history that emit a candidate SQL. Each one is an
+# "iteration": generate_sql is iter 0, the first revise is iter 1, etc.
+SQL_NODES = ("generate_sql", "revise")
+
+
+def _attempts_from_history(history: list[dict]) -> list[str]:
+    """Pull the ordered list of candidate SQL strings the agent produced.
+
+    The agent records one entry per node call; generate_sql and revise each
+    carry the SQL they emitted. The order in history is the order they ran,
+    so index 0 is the first attempt (iter 0), index 1 the first revision, etc.
+    """
+    return [h["sql"] for h in history if h.get("node") in SQL_NODES and "sql" in h]
+
+
 def eval_one(question: dict, agent_url: str) -> dict:
-    """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    """Score one question by execution accuracy, per iteration.
+
+    Runs the gold SQL once to get the reference rows, calls the agent, then
+    replays every SQL the agent produced (one per iteration) against the DB
+    and compares canonicalized row sets to gold. Returns a record with a
+    per-iteration correctness list plus final/agent bookkeeping.
+    """
+    db_id = question["db_id"]
+    gold_sql = question["gold_sql"]
+
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+
+    record: dict = {
+        "db_id": db_id,
+        "question": question["question"],
+        "gold_sql": gold_sql,
+        "gold_exec_ok": gold_ok,
+        "gold_error": gold_err,
+        "iterations": [],   # per-iteration: {iter, node, sql, exec_ok, correct, ...}
+        "final_sql": "",
+        "final_correct": False,
+        "agent_iterations": 0,
+        "agent_ok": False,
+        "agent_error": None,
+    }
+
+    # Call the agent over HTTP. The server field is `db` (not db_id); tags are
+    # forwarded to Langfuse as metadata so Phase 6 can filter these runs.
+    try:
+        resp = httpx.post(
+            agent_url,
+            json={"question": question["question"], "db": db_id, "tags": {"suite": "eval", "db_id": db_id}},
+            timeout=180.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:  # noqa: BLE001
+        record["agent_error"] = f"{type(e).__name__}: {e}"
+        return record
+
+    record["final_sql"] = payload.get("sql", "")
+    record["agent_iterations"] = payload.get("iterations", 0)
+    record["agent_ok"] = bool(payload.get("ok", False))
+    if payload.get("error"):
+        record["agent_error"] = payload["error"]
+
+    attempts = _attempts_from_history(payload.get("history", []))
+    # Fall back to the served SQL if history didn't surface any attempt.
+    if not attempts and record["final_sql"]:
+        attempts = [record["final_sql"]]
+
+    per_iter: list[dict] = []
+    for i, sql in enumerate(attempts):
+        exec_ok, pred_rows, pred_err = run_sql(db_id, sql)
+        per_iter.append({
+            "iter": i,
+            "node": SQL_NODES[0] if i == 0 else SQL_NODES[1],
+            "sql": sql,
+            "exec_ok": exec_ok,
+            "exec_error": pred_err,
+            "n_rows": len(pred_rows) if pred_rows is not None else None,
+            "correct": matches(gold_rows, pred_rows),
+        })
+
+    record["iterations"] = per_iter
+    record["final_correct"] = per_iter[-1]["correct"] if per_iter else False
+    return record
 
 
 def summarize(results: list[dict]) -> dict:
-    """Aggregate per-question results.
+    """Aggregate per-question results into overall + per-iteration pass rates.
 
     Per-iteration carry-forward: if the agent terminated at iteration j < k
     (verify said ok at j, or it hit MAX_ITERATIONS at j < k), treat the
@@ -70,7 +150,50 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    overall_correct = sum(1 for r in results if r["final_correct"])
+
+    # k ranges over every iteration any question reached (>=1 column so the
+    # table is never empty even if every run errored out).
+    max_iters = max((len(r["iterations"]) for r in results), default=0)
+    max_iters = max(max_iters, 1)
+
+    per_iteration: list[dict] = []
+    for k in range(max_iters):
+        correct_at_k = 0
+        for r in results:
+            iters = r["iterations"]
+            if not iters:
+                continue  # no attempt ever produced -> incorrect at every k
+            # Carry forward: clamp to the last attempt the agent actually made.
+            idx = min(k, len(iters) - 1)
+            if iters[idx]["correct"]:
+                correct_at_k += 1
+        per_iteration.append({
+            "iter": k,
+            "correct": correct_at_k,
+            "pass_rate": round(correct_at_k / n, 4) if n else 0.0,
+        })
+
+    # Diagnostics: how much the loop is actually buying you, plus data/agent health.
+    gold_failures = sum(1 for r in results if not r["gold_exec_ok"])
+    agent_errors = sum(1 for r in results if r["agent_error"] and not r["iterations"])
+    avg_iterations = (
+        round(sum(len(r["iterations"]) for r in results) / n, 3) if n else 0.0
+    )
+    iter0 = per_iteration[0]["pass_rate"] if per_iteration else 0.0
+    iterN = per_iteration[-1]["pass_rate"] if per_iteration else 0.0
+
+    return {
+        "n_questions": n,
+        "overall_correct": overall_correct,
+        "overall_pass_rate": round(overall_correct / n, 4) if n else 0.0,
+        "per_iteration_pass_rate": per_iteration,
+        "loop_gain": round(iterN - iter0, 4),  # iter0 -> final pass-rate lift
+        "avg_iterations": avg_iterations,
+        "gold_exec_failures": gold_failures,
+        "agent_request_errors": agent_errors,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
