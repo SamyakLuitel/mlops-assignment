@@ -55,9 +55,15 @@ def health() -> dict[str, str]:
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
+    # Forward request tags as Langfuse trace metadata, and also surface each as
+    # a filterable Tag chip ("key:value") via the reserved langfuse_tags key the
+    # LangChain integration reads off the run config.
+    metadata: dict[str, Any] = dict(req.tags)
+    if req.tags:
+        metadata["langfuse_tags"] = [f"{k}:{v}" for k, v in req.tags.items()]
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
+        "metadata": metadata,
     }
     try:
         final = graph.invoke(state, config=config)
