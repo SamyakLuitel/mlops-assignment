@@ -77,8 +77,16 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
-        timeout=20,
-        max_retries=2,
+        # Tight timeout + single retry (Phase 6): the load test showed the
+        # ~12% errors are non-transient (retries don't reduce the count), so an
+        # aggressive retry budget just inflated the tail to a 118s max. One
+        # retry absorbs a genuine connection blip; a 10s cap fails a stuck call
+        # fast instead of letting it pin a slow-path run near the driver cap.
+        timeout=10,
+        max_retries=1,
+        # SQL outputs are short; cap decode so a model that ignores "SQL only"
+        # can't ramble into a long, slow generation.
+        max_tokens=512,
     )
 
 
