@@ -8,13 +8,13 @@ Graph shape:
                                                           |
                                               ok=false ---+----> revise -> execute -> verify (loop)
 
-verify carries a cheap fast path (Phase 6): if the SQL executed cleanly AND
-returned rows, it returns ok=true with no LLM call, so the common case is a
-single LLM call (generate only). It spends the verify LLM call only on the
-cases revision can actually help — execution errors and 0-row results (a query
-that ran but returned nothing when the question implies rows exist). The verify
-node always runs, so every trace shows the generate/verify/(revise) waterfall.
-Loop is capped at MAX_ITERATIONS total generate/revise calls.
+verify carries a cheap fast path (Phase 6): if the SQL executed cleanly it
+returns ok=true with no LLM call, so the common case is a single LLM call
+(generate only). It spends the verify LLM call only when execution errored —
+the one case a revise can actually fix. The verify node always runs, so every
+trace still shows the generate/verify/(revise) waterfall (verify is just a
+no-op span on clean executions). Loop is capped at MAX_ITERATIONS total
+generate/revise calls.
 
 The execute node and the graph wiring are provided. `generate_sql_node` is
 filled in as a worked example; you implement `verify`, `revise`, and the
@@ -36,8 +36,10 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Capped at 2 (one revise) for Phase 6: bounds the error-path tail to ~3 LLM
+# calls and cuts vLLM load, and Phase 5 (loop gain 0) showed extra revises
+# recover no accuracy, so a tighter cap costs nothing.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -164,12 +166,14 @@ async def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
 
-    Fast path (Phase 6): if the SQL executed cleanly AND returned rows, trust it
-    and return ok=true without an LLM call. The verifier is spent only on the
-    cases a revise can actually fix — execution errors and 0-row results (ran,
-    but the question implies rows should exist). This keeps the common case at a
-    single LLM call while still routing the suspicious clean executions through
-    review, all without skipping the verify node (so traces stay complete).
+    Fast path (Phase 6): if the SQL executed cleanly, trust it and return ok=true
+    with no LLM call. The verifier is spent only where a revise can actually
+    help — execution errors. We deliberately do NOT spend an LLM call on clean
+    0-row results: under load most wrong SQL returns 0 rows, so verifying that
+    case dominates latency (it pushed P50 from 1.4s to ~6.9s in a load test),
+    and Phase 5 showed the verify->revise loop recovers zero questions anyway
+    (loop gain 0). The verify node still always runs, so every trace shows the
+    waterfall, but it's a no-op (no nested LLM span) on clean executions.
     """
     ex = state.execution
     if ex is None:
@@ -178,7 +182,7 @@ async def verify_node(state: AgentState) -> dict:
             "verify_issue": "no execution result",
             "history": state.history + [{"node": "verify", "ok": False, "issue": "no execution result"}],
         }
-    if ex.ok and ex.row_count > 0:
+    if ex.ok:
         return {
             "verify_ok": True,
             "verify_issue": "",
