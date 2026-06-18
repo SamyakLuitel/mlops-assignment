@@ -62,12 +62,21 @@ class AgentState:
 
 
 def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default).
+
+    timeout + max_retries (Phase 6): under load vLLM occasionally rejects or
+    drops a call, which would otherwise bubble up as a hard HTTP 500 from the
+    agent (an error-budget SLO failure independent of latency). A bounded retry
+    turns transient failures into retried successes; the timeout caps a stuck
+    call so a single hang can't pin a slow-path run at the 120s driver cap.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        timeout=20,
+        max_retries=2,
     )
 
 
@@ -107,17 +116,22 @@ def _parse_verify(text: str) -> tuple[bool, str]:
         return False, f"could not parse verifier output: {text[:200]}"
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
+    Async (Phase 6): the node awaits llm().ainvoke so the FastAPI event loop can
+    hold many concurrent agent runs while each waits on vLLM, instead of being
+    capped by the sync threadpool. The call MUST be awaited - if the node stayed
+    sync, LangGraph's ainvoke would run it back in a thread and the ceiling returns.
+
     This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
     in prompts.py to make it produce real queries.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -137,7 +151,7 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
     Follow the generate_sql_node pattern: build messages from the VERIFY_*
@@ -151,7 +165,7 @@ def verify_node(state: AgentState) -> dict:
     in the README.
     """
     result = state.execution.render() if state.execution else "ERROR: no execution result"
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
             question=state.question,
@@ -167,7 +181,7 @@ def verify_node(state: AgentState) -> dict:
     }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
     Same shape as generate_sql_node, but the prompt should include the failing
@@ -178,7 +192,7 @@ def revise_node(state: AgentState) -> dict:
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
     result = state.execution.render() if state.execution else "ERROR: no execution result"
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
