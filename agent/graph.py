@@ -1,20 +1,20 @@
 """LangGraph agent: text-to-SQL with verify+revise loop.
 
-Graph shape (with the Phase 6 fast path):
+Graph shape:
 
-    START -> attach_schema -> generate_sql -> execute -> [exec ok?]
-                                                            |
-                              exec ok --------- fast path --+----> END  (skip verify)
-                                                            |
-                              exec failed ------------------+----> verify
-                                                                     |
-                                              verify ok -------------+----> END
-                                                                     |
-                                              not ok ---------------+----> revise -> execute (loop)
+    START -> attach_schema -> generate_sql -> execute -> verify
+                                                          |
+                                              ok=true ----+----> END
+                                                          |
+                                              ok=false ---+----> revise -> execute -> verify (loop)
 
-The fast path serves cleanly-executing SQL with a single LLM call; the
-verify -> revise loop only runs when execution errored. Loop is capped at
-MAX_ITERATIONS total generate/revise calls.
+verify carries a cheap fast path (Phase 6): if the SQL executed cleanly AND
+returned rows, it returns ok=true with no LLM call, so the common case is a
+single LLM call (generate only). It spends the verify LLM call only on the
+cases revision can actually help — execution errors and 0-row results (a query
+that ran but returned nothing when the question implies rows exist). The verify
+node always runs, so every trace shows the generate/verify/(revise) waterfall.
+Loop is capped at MAX_ITERATIONS total generate/revise calls.
 
 The execute node and the graph wiring are provided. `generate_sql_node` is
 filled in as a worked example; you implement `verify`, `revise`, and the
@@ -163,8 +163,29 @@ async def verify_node(state: AgentState) -> dict:
     Return: {"verify_ok": <bool>, "verify_issue": <str>}.
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
+
+    Fast path (Phase 6): if the SQL executed cleanly AND returned rows, trust it
+    and return ok=true without an LLM call. The verifier is spent only on the
+    cases a revise can actually fix — execution errors and 0-row results (ran,
+    but the question implies rows should exist). This keeps the common case at a
+    single LLM call while still routing the suspicious clean executions through
+    review, all without skipping the verify node (so traces stay complete).
     """
-    result = state.execution.render() if state.execution else "ERROR: no execution result"
+    ex = state.execution
+    if ex is None:
+        return {
+            "verify_ok": False,
+            "verify_issue": "no execution result",
+            "history": state.history + [{"node": "verify", "ok": False, "issue": "no execution result"}],
+        }
+    if ex.ok and ex.row_count > 0:
+        return {
+            "verify_ok": True,
+            "verify_issue": "",
+            "history": state.history + [{"node": "verify", "ok": True, "issue": ""}],
+        }
+
+    result = ex.render()
     response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
@@ -212,25 +233,6 @@ async def revise_node(state: AgentState) -> dict:
     }
 
 
-def route_after_execute(state: AgentState) -> str:
-    """Fast path: if the SQL executed cleanly, serve it and skip verify.
-
-    The common case (valid SQL on the first try) becomes a single LLM call
-    instead of generate + verify, which keeps a full agent run well under the
-    5s P95 SLO and drops the in-flight concurrency at a given RPS enough to
-    fit the server's thread budget. The verify -> revise loop is preserved for
-    the error case, where it earns its keep fixing broken queries.
-
-    Two ways to end here: execution succeeded (fast path), or we are out of
-    iteration budget and there is nothing left to revise.
-    """
-    if state.execution and state.execution.ok:
-        return "end"
-    if state.iteration >= MAX_ITERATIONS:
-        return "end"
-    return "verify"
-
-
 def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
@@ -257,11 +259,7 @@ def build_graph():
     g.add_edge(START, "attach_schema")
     g.add_edge("attach_schema", "generate_sql")
     g.add_edge("generate_sql", "execute")
-    g.add_conditional_edges(
-        "execute",
-        route_after_execute,
-        {"verify": "verify", "end": END},
-    )
+    g.add_edge("execute", "verify")
     g.add_conditional_edges(
         "verify",
         route_after_verify,
