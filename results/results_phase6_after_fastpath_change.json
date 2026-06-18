@@ -1,0 +1,15 @@
+{
+  "requested_rps": 10.0,
+  "duration_seconds": 300,
+  "wall_clock_seconds": 324.42428703899986,
+  "total_requests": 3000,
+  "achieved_rps": 9.247149858541146,
+  "ok": 2599,
+  "timeouts": 0,
+  "http_errors": 375,
+  "client_errors": 26,
+  "latency_p50": 2.52914814199994,
+  "latency_p95": 19.407632560999446,
+  "latency_p99": 28.060323439999593,
+  "latency_max": 118.50466678700013
+}

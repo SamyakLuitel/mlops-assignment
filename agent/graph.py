@@ -1,20 +1,20 @@
 """LangGraph agent: text-to-SQL with verify+revise loop.
 
-Graph shape (with the Phase 6 fast path):
+Graph shape:
 
-    START -> attach_schema -> generate_sql -> execute -> [exec ok?]
-                                                            |
-                              exec ok --------- fast path --+----> END  (skip verify)
-                                                            |
-                              exec failed ------------------+----> verify
-                                                                     |
-                                              verify ok -------------+----> END
-                                                                     |
-                                              not ok ---------------+----> revise -> execute (loop)
+    START -> attach_schema -> generate_sql -> execute -> verify
+                                                          |
+                                              ok=true ----+----> END
+                                                          |
+                                              ok=false ---+----> revise -> execute -> verify (loop)
 
-The fast path serves cleanly-executing SQL with a single LLM call; the
-verify -> revise loop only runs when execution errored. Loop is capped at
-MAX_ITERATIONS total generate/revise calls.
+verify carries a cheap fast path (Phase 6): if the SQL executed cleanly it
+returns ok=true with no LLM call, so the common case is a single LLM call
+(generate only). It spends the verify LLM call only when execution errored —
+the one case a revise can actually fix. The verify node always runs, so every
+trace still shows the generate/verify/(revise) waterfall (verify is just a
+no-op span on clean executions). Loop is capped at MAX_ITERATIONS total
+generate/revise calls.
 
 The execute node and the graph wiring are provided. `generate_sql_node` is
 filled in as a worked example; you implement `verify`, `revise`, and the
@@ -36,8 +36,10 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Capped at 2 (one revise) for Phase 6: bounds the error-path tail to ~3 LLM
+# calls and cuts vLLM load, and Phase 5 (loop gain 0) showed extra revises
+# recover no accuracy, so a tighter cap costs nothing.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -62,12 +64,29 @@ class AgentState:
 
 
 def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default).
+
+    timeout + max_retries (Phase 6): under load vLLM occasionally rejects or
+    drops a call, which would otherwise bubble up as a hard HTTP 500 from the
+    agent (an error-budget SLO failure independent of latency). A bounded retry
+    turns transient failures into retried successes; the timeout caps a stuck
+    call so a single hang can't pin a slow-path run at the 120s driver cap.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        # Tight timeout + single retry (Phase 6): the load test showed the
+        # ~12% errors are non-transient (retries don't reduce the count), so an
+        # aggressive retry budget just inflated the tail to a 118s max. One
+        # retry absorbs a genuine connection blip; a 10s cap fails a stuck call
+        # fast instead of letting it pin a slow-path run near the driver cap.
+        timeout=10,
+        max_retries=1,
+        # SQL outputs are short; cap decode so a model that ignores "SQL only"
+        # can't ramble into a long, slow generation.
+        max_tokens=512,
     )
 
 
@@ -107,17 +126,22 @@ def _parse_verify(text: str) -> tuple[bool, str]:
         return False, f"could not parse verifier output: {text[:200]}"
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
+    Async (Phase 6): the node awaits llm().ainvoke so the FastAPI event loop can
+    hold many concurrent agent runs while each waits on vLLM, instead of being
+    capped by the sync threadpool. The call MUST be awaited - if the node stayed
+    sync, LangGraph's ainvoke would run it back in a thread and the ceiling returns.
+
     This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
     in prompts.py to make it produce real queries.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -137,7 +161,7 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
     Follow the generate_sql_node pattern: build messages from the VERIFY_*
@@ -149,9 +173,32 @@ def verify_node(state: AgentState) -> dict:
     Return: {"verify_ok": <bool>, "verify_issue": <str>}.
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
+
+    Fast path (Phase 6): if the SQL executed cleanly, trust it and return ok=true
+    with no LLM call. The verifier is spent only where a revise can actually
+    help — execution errors. We deliberately do NOT spend an LLM call on clean
+    0-row results: under load most wrong SQL returns 0 rows, so verifying that
+    case dominates latency (it pushed P50 from 1.4s to ~6.9s in a load test),
+    and Phase 5 showed the verify->revise loop recovers zero questions anyway
+    (loop gain 0). The verify node still always runs, so every trace shows the
+    waterfall, but it's a no-op (no nested LLM span) on clean executions.
     """
-    result = state.execution.render() if state.execution else "ERROR: no execution result"
-    response = llm().invoke([
+    ex = state.execution
+    if ex is None:
+        return {
+            "verify_ok": False,
+            "verify_issue": "no execution result",
+            "history": state.history + [{"node": "verify", "ok": False, "issue": "no execution result"}],
+        }
+    if ex.ok:
+        return {
+            "verify_ok": True,
+            "verify_issue": "",
+            "history": state.history + [{"node": "verify", "ok": True, "issue": ""}],
+        }
+
+    result = ex.render()
+    response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
             question=state.question,
@@ -167,7 +214,7 @@ def verify_node(state: AgentState) -> dict:
     }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
     Same shape as generate_sql_node, but the prompt should include the failing
@@ -178,7 +225,7 @@ def revise_node(state: AgentState) -> dict:
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
     result = state.execution.render() if state.execution else "ERROR: no execution result"
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
@@ -196,25 +243,6 @@ def revise_node(state: AgentState) -> dict:
             {"node": "revise", "sql": sql, "issue": state.verify_issue}
         ],
     }
-
-
-def route_after_execute(state: AgentState) -> str:
-    """Fast path: if the SQL executed cleanly, serve it and skip verify.
-
-    The common case (valid SQL on the first try) becomes a single LLM call
-    instead of generate + verify, which keeps a full agent run well under the
-    5s P95 SLO and drops the in-flight concurrency at a given RPS enough to
-    fit the server's thread budget. The verify -> revise loop is preserved for
-    the error case, where it earns its keep fixing broken queries.
-
-    Two ways to end here: execution succeeded (fast path), or we are out of
-    iteration budget and there is nothing left to revise.
-    """
-    if state.execution and state.execution.ok:
-        return "end"
-    if state.iteration >= MAX_ITERATIONS:
-        return "end"
-    return "verify"
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -243,11 +271,7 @@ def build_graph():
     g.add_edge(START, "attach_schema")
     g.add_edge("attach_schema", "generate_sql")
     g.add_edge("generate_sql", "execute")
-    g.add_conditional_edges(
-        "execute",
-        route_after_execute,
-        {"verify": "verify", "end": END},
-    )
+    g.add_edge("execute", "verify")
     g.add_conditional_edges(
         "verify",
         route_after_verify,
