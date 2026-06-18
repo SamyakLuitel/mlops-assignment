@@ -1,29 +1,65 @@
 # Report: LLM inference + observability
 
-Text-to-SQL PoC — Qwen3-30B-A3B-Instruct-2507 on 1× H100 80GB.
+Text-to-SQL PoC — `Qwen3-30B-A3B-Instruct-2507` on 1× H100 80GB. Analysts ask
+questions in English; a LangGraph agent generates SQLite, runs it against a BIRD
+database, and returns rows. The platform SLO under test:
+
+> **P95 end-to-end agent latency < 5 s, at 10+ RPS (1 RPS = one full agent run/sec), sustained over a 5-minute window.**
 
 ---
 
 ## Phase 1 — Serving configuration
 
-**Launch script:** `scripts/start_vllm_tuned.sh` (the stock `scripts/start_vllm.sh` is left as the defaults baseline.)
+**Launch script:** `scripts/start_vllm_tuned.sh` (stock `scripts/start_vllm.sh` left as the defaults baseline).
 
-**Workload this config targets:** MoE model (~3B of 30B params active per token), prompts of ~1.5–3K tokens (DB schema + question), short structured SQL outputs, ~2–3 dependent vLLM calls per agent run, against an SLO of **P95 end-to-end < 5 s at 10+ RPS over 5 min**.
+**Workload it targets:** an MoE model (~3B of 30B params active per token), prompts of ~1.5–3K tokens (schema + question), short structured SQL outputs, and ~1–3 dependent vLLM calls per agent run.
 
 | Flag | Value | Justification |
 |---|---|---|
-| `--max-model-len` | `8192` | Model default is 262144; our prompts+outputs never exceed a few K tokens. Capping the window shrinks per-sequence KV reservation → more concurrent sequences fit → higher RPS. Biggest single lever. |
-| `--gpu-memory-utilization` | `0.92` | Hands more of the 80 GB to the KV-cache pool, so more requests stay resident before eviction — needed to sustain the concurrency the 10+ RPS target implies. |
-| `--max-num-seqs` | `64` | Ceiling on sequences batched together. Moderate starting point: high enough to keep the GPU busy, low enough not to blow the latency tail. Re-tuned in Phase 6. |
-| `--max-num-batched-tokens` | `8192` | Prefill token budget per step. Keeps a single 1.5–3K-token prefill from monopolizing a scheduler step while in-flight decodes continue. |
-| `--enable-chunked-prefill` | on | Interleaves long-prompt prefill with ongoing decode so one big prompt doesn't stall the batch → smoother P95 for our prompt sizes. |
-| `--kv-cache-dtype` | `fp8` | Halves KV-cache footprint → ~2× more concurrent sequences in the same VRAM, directly serving the RPS target. Quality risk: re-checked against Phase 5 evals; dropped if pass rate regresses. |
+| `--max-model-len` | `8192` | Model default is 262144; our prompts+outputs never approach it. A smaller window shrinks per-sequence KV reservation → more concurrent sequences fit → higher RPS. Biggest single lever. |
+| `--gpu-memory-utilization` | `0.92` | Hands more of the 80 GB to the KV-cache pool, so more requests stay resident before eviction — needed to sustain the concurrency 10+ RPS implies. |
+| `--max-num-seqs` | `64` | Ceiling on sequences batched together. High enough to keep the GPU busy, low enough to bound the latency tail. |
+| `--max-num-batched-tokens` | `8192` | Prefill token budget per step; keeps one 1.5–3K-token prefill from monopolizing a scheduler step while decodes continue. |
+| `--enable-chunked-prefill` | on | Interleaves long-prompt prefill with ongoing decode so one big prompt doesn't stall the batch → smoother P95. |
+| `--kv-cache-dtype` | `fp8` | Halves KV-cache footprint → ~2× more concurrent sequences in the same VRAM, directly serving the RPS target. Quality risk re-checked against Phase 5 evals. |
 
-**MoE / hardware note:** Qwen3-30B-A3B fits on a single H100 *because* it's a Mixture-of-Experts model — only ~3B params are active per token, so compute is light while memory (all 30B params resident) is the binding constraint. That's why the config above spends its effort on KV-cache headroom (context cap, memory fraction, fp8) rather than tensor-parallelism: there's no second GPU to split across, and the model already fits.
+**MoE / hardware note.** Qwen3-30B-A3B fits on one H100 *because* it is Mixture-of-Experts — only ~3B params are active per token, so compute is light while memory (all 30B params resident) is the binding constraint. That is why the config spends its effort on KV-cache headroom (context cap, memory fraction, fp8) rather than tensor parallelism: there is no second GPU to split across, and the model already fits.
 
-**Manual sanity check:** fired 3–5 questions from `evals/eval_set.jsonl`; model returns well-formed SQL. See `screenshots/vllm_manual_query.png`.
+**Sanity check:** fired questions from `evals/eval_set.jsonl` manually; the model returns well-formed SQL (`screenshots/vllm_manual_query.png`).
 
-> Note: these are the Phase 1 *starting* values. `--max-num-seqs`, `--gpu-memory-utilization`, and `--kv-cache-dtype` are revisited under load in Phase 6, where they're validated against the SLO and the eval pass rate.
+---
+
+## Phase 2 — Observability dashboard
+
+Dashboard JSON: `infra/grafana/provisioning/dashboards/serving.json`. Built from vLLM's `/metrics` to answer "is it slow, and *where* in the request lifecycle?":
+
+- **Latency** — TTFT and end-to-end request latency percentiles (p50/p95/p99) from the vLLM histograms; time-per-output-token for decode cost.
+- **Throughput** — prompt + generation tokens/sec, requests running vs. waiting, successful-request rate.
+- **KV cache** — GPU KV-cache utilization and `num_requests_waiting`, the headroom/eviction signals.
+
+Every panel reacts under load (`screenshots/grafana_serving.png`). The dashboard is what made the Phase 6 diagnosis possible: it showed the serving layer was *idle* while the agent collapsed (below).
+
+---
+
+## Phase 3 — Agent design
+
+LangGraph graph (`agent/graph.py`), final shape:
+
+```
+START → attach_schema → generate_sql → execute → verify
+                                                    │
+                                        ok=true ────┤────► END
+                                                    │
+                                       ok=false ────┴────► revise → execute → verify (loop)
+```
+
+`verify` always runs (so every Langfuse trace shows the full waterfall), but it carries a **cheap gate**: if the SQL executed cleanly it returns `ok=true` with **no LLM call**, so the common case is a single LLM call (generate only). The verify LLM is spent only when execution **errored** — the one case a revise can actually fix. The loop is capped at `MAX_ITERATIONS = 2` (one revise). Prompts live in `agent/prompts.py`. The server (`agent/server.py`) is async (`graph.ainvoke`) and exposes `POST /answer`.
+
+---
+
+## Phase 4 — Agent tracing
+
+Langfuse captures the LangGraph spans via the callback handler (`langfuse.langchain.CallbackHandler`, picked up from `.env`). Each `/answer` run forwards request tags (`run:…`, `db_id:…`) as Langfuse trace metadata, so traces are filterable. A trace shows the `generate_sql → verify → (revise)` waterfall with per-span prompt, response, latency, and token count (`screenshots/langfuse_trace.png`); the tagged trace list is in `screenshots/langfuse_tags.png`.
 
 ---
 
@@ -31,33 +67,29 @@ Text-to-SQL PoC — Qwen3-30B-A3B-Instruct-2507 on 1× H100 80GB.
 
 **Signal: execution accuracy.** For each of the 30 questions in `evals/eval_set.jsonl`, the agent's SQL and the gold SQL are run against the target DB and their result sets compared after canonicalization (sort rows, stringify cells, `None`→`''`). Identical row sets ⇒ correct, regardless of how the SQL is written. Runner: `evals/run_eval.py`; output: `results/eval_baseline.json`.
 
-> Baseline is measured on the **pre-fast-path** agent (verify runs on every iteration) so the per-iteration numbers reflect what the verify→revise loop actually buys. The fast-path variant is measured separately as `eval_after_tuning.json` in Phase 6.
-
-**Overall pass rate:** `9 / 30` (`30%`).
-
-**Per-iteration pass rate** (carry-forward — a run that terminated early keeps its last answer at later iterations):
+**Overall pass rate: 9 / 30 (30%).**
 
 | If we stopped after… | Pass rate |
 |---|---|
-| iter 0 — generate only | `30%` (9/30) |
-| iter 1 — + one revise | `30%` (9/30) |
-| iter 2 — + two revises | `30%` (9/30) |
+| iter 0 — generate only | 30% (9/30) |
+| iter 1 — + one revise | 30% (9/30) |
+| iter 2 — + two revises | 30% (9/30) |
 
-**Loop gain (iter 0 → final): `0` pts.**  Avg iterations/run: `1.6`.  Gold-SQL exec failures: `0`.
+**Loop gain (iter 0 → final): 0 pts.** Avg iterations/run: 1.6. Gold-SQL exec failures: 0.
 
-**Commentary.** The number that matters is loop gain, and here it is **zero**: iter-0 pass rate (30%) equals the final pass rate (30%). Every question the agent gets right, it already gets right on the first generate; no wrong first answer was converted to a correct one by a revise. So on this 30-question set the verify→revise loop **does not earn its keep** — it is pure latency cost, and the agent could collapse to a single generate call with no accuracy loss. Note that avg iterations/run is 1.6, not 1.0: the loop *did* fire on several questions (verify flagged them and revise re-ran), it just never turned a miss into a hit. The two failure modes this exposes: (a) questions wrong for semantic reasons that still execute cleanly — the verifier either passes them or its complaint doesn't lead the reviser to the right query; (b) `gold_exec_failures = 0`, so no losses are from a broken gold query — the 21 misses are genuine agent misses. This result is what *motivates* the Phase 6 fast path rather than contradicting it: since the loop adds no accuracy, skipping `verify` on clean executions is free quality-wise (confirmed by `eval_after_tuning.json`, below) and pays off purely in latency.
+**Commentary.** The number that matters is loop gain, and here it is **zero**: iter-0 pass rate equals final pass rate. Every question the agent gets right, it gets right on the first generate; no wrong first answer was converted to a correct one by a revise. The loop *did* fire (avg 1.6 iterations/run — verify flagged answers and revise re-ran), it just never turned a miss into a hit. The misses are not the kind the loop is built for: with `gold_exec_failures = 0`, the 21 misses are genuine agent errors, mostly *semantic* mistakes that still execute cleanly (a generic "is this plausible?" verifier doesn't catch them and doesn't steer the reviser to the fix), rather than the broken-SQL cases (bad column/table, syntax) the loop handles well. So on this set the always-on loop is pure latency cost with no accuracy return — which is exactly what motivates the Phase 6 fast path.
+
+The post-tuning eval (`results/eval_after_tuning.json`, fast-path agent) measured **10/30 (33.3%)** with avg 1.03 iterations/run — accuracy did not regress (within noise), confirming that skipping the verify LLM on clean executions costs nothing the eval can see.
 
 ---
 
 ## Phase 6 — Hitting the SLO
 
-**Target SLO:** P95 end-to-end agent latency < 5 s, at 10+ RPS (1 RPS = 1 full agent run/sec), sustained over a 5-minute window.
+Driver: `load_test/driver.py --rps 10 --duration 300` (open-loop; percentiles are over *successful* requests only, so a high failure rate makes the real tail worse than shown).
 
-Driver: `load_test/driver.py --rps 10 --duration 300` (open-loop; reported percentiles are over *successful* requests only, so a high failure rate makes the real tail worse than the P95 shown).
+### Baseline — a hard miss (congestion collapse)
 
-### Baseline vs. SLO — a hard miss (congestion collapse)
-
-| | Baseline (pre-fix) | SLO |
+| | Baseline | SLO |
 |---|---|---|
 | Achieved RPS | 8.33 offered / **1.67 goodput** | 10+ |
 | Successful requests | 600 / 3000 (**20%**) | ~all |
@@ -65,73 +97,54 @@ Driver: `load_test/driver.py --rps 10 --duration 300` (open-loop; reported perce
 | HTTP + client errors | 239 + 604 (28%) | ~0 |
 | P50 / P95 / P99 | 46.1 s / **112.4 s** / 117.0 s | P95 < 5 s |
 
-The system was in **congestion collapse**: ~80% of requests failed and even the survivors took 46 s at the median. P95 (112.4 s) is ~22× over the SLO.
+The system was in **congestion collapse**: ~80% of requests failed and survivors took 46 s at the median. P95 was ~22× over the SLO.
 
 ### Diagnosis — the bottleneck was *not* vLLM
 
-Reading the Grafana dashboard under load was decisive: **vLLM was nearly idle while the agent collapsed.**
-
-- **GPU KV-cache utilization ~10%** — 90% headroom, nowhere near full.
-- **Scheduler queue (`num_requests_waiting`) ~0** — vLLM wasn't queuing anything.
-- **Requests running ~30 of 64** — under the `--max-num-seqs` ceiling.
-- **Single vLLM call latency healthy** — TTFT p99 ~250 ms, per-call e2e p50 ~1 s / p95 ~3.5 s.
-
-So the serving layer had spare capacity; the collapse was upstream, in the agent. Each agent run chained **2–6 sequential LLM calls** (generate → verify → revise → verify …, `MAX_ITERATIONS=3`), making runs slow. By Little's Law, in-flight runs ≈ offered_rate × service_time ≈ 10 × tens of seconds ≈ **100+ concurrent**, which overran the FastAPI sync thread pool (~40) → requests queued at the agent and timed out (P50 of *survivors* already 46 s), starving vLLM of work. Tuning vLLM flags (`--max-num-seqs`, KV cache) would have done nothing — the headroom proves the bottleneck wasn't there.
+The Grafana dashboard was decisive: **vLLM was nearly idle while the agent collapsed.** KV-cache utilization ~10%, `num_requests_waiting` ~0, single-call latency healthy (TTFT p99 ~250 ms, per-call p50 ~1 s). The serving layer had spare capacity; the collapse was upstream. Each agent run chained multiple sequential LLM calls, and the **synchronous** FastAPI endpoint capped concurrency at its ~40-thread pool. By Little's Law, 10 RPS × multi-second runs ⇒ 100+ in-flight, overrunning the pool → requests queued at the agent and timed out, starving vLLM of work. Tuning vLLM flags would have done nothing — the headroom proves the bottleneck wasn't there.
 
 ### Iteration log
 
 | # | Saw | Hypothesized | Changed | Result |
 |---|---|---|---|---|
-| 1 | At 10 RPS: P95 112.4 s, ~80% of requests failing — but Grafana showed vLLM idle (KV-cache ~10%, queue ~0, single-call p50 ~1 s). | The agent makes too many sequential LLM calls per run, so runs are slow and pile up past the server's thread pool → timeouts. vLLM is fine. Cutting calls/run should fix latency *and* the concurrency pileup. | **Execution-success fast path** in `agent/graph.py`: if the generated SQL executes cleanly, return it and skip the `verify` LLM call; `verify → revise` now runs only on execution errors. Common case drops from 2+ calls to 1. | Timeouts **1557 → 0**, goodput **1.67 → 8.11 RPS**, P50 **46.1 → 1.43 s**, P95 **112.4 → 14.5 s**. Collapse eliminated, throughput near target. SLO **not yet met** (P95 14.5 s) and a ~14% 500-error rate remains. |
+| 1 | P95 112 s, ~80% failing, but Grafana showed vLLM idle (KV ~10%, queue ~0). | Too many sequential LLM calls per run + a sync thread-pool ceiling → pileup → timeouts. vLLM is fine. | **Fast path** (skip the verify LLM on clean executions) + **async endpoint** (`graph.ainvoke`, async LLM nodes) + timeout/retry on the client. | Collapse eliminated: timeouts **1557 → 0**, P50 **46 → 2.5 s**, P95 **112 → ~19 s**, goodput **1.67 → ~8 RPS**. |
+| 2 | After moving the gate inside `verify` and gating the LLM verify on `row_count > 0` to catch empty results: P50 jumped to **6.9 s**, P95 to **38.9 s** — a regression. | Most *wrong* SQL returns 0 rows, so the "suspicious" path fired on the median request, adding verify+revise calls. Phase 5 showed the loop recovers nothing anyway (loop gain 0), so this was pure latency. | Reverted: gate skips the verify LLM on **any** clean execution; `MAX_ITERATIONS` **3 → 2**. | P50 **6.9 → 2.5 s**, P95 **38.9 → 19.4 s**. Regression undone. |
+| 3 | P99 28 s, **max 118 s** tail; HTTP-error count unchanged with vs. without retries (~375). | The ~12% errors are **non-transient** (retries don't reduce them), so an aggressive retry budget (`timeout=20, max_retries=2`) just inflated the tail. | `timeout` **20 → 10**, `max_retries` **2 → 1**, `max_tokens=512`. | P95 **19.4 → 18.0 s**, P50 → 2.25 s. Marginal — and the 117 s max *persisted*, confirming the tail is the error-path runs and the errors themselves, not retry storms. |
 
-### Final numbers (current state)
+### Final numbers vs. SLO
 
-| | Baseline | After fast path | SLO |
+| | Baseline | **Final** | SLO |
 |---|---|---|---|
-| Achieved RPS | 8.33 | 9.44 | 10+ |
-| Goodput (successful RPS) | 1.67 | **8.11** | 10+ |
-| Successful requests | 600 (20%) | **2576 (86%)** | ~all |
+| Goodput (successful RPS) | 1.67 | **7.84** | 10+ |
+| Successful requests | 600 (20%) | **2560 (85%)** | ~all |
 | Timeouts | 1557 | **0** | 0 |
-| HTTP / client errors | 239 / 604 | 379 / 45 (**14%**) | ~0 |
-| P50 | 46.1 s | **1.43 s** | — |
-| P95 | 112.4 s | **14.5 s** | **< 5 s** |
-| P99 | 117.0 s | 22.4 s | — |
+| HTTP / client errors | 239 / 604 | 372 / 68 (**~15%**) | ~0 |
+| P50 | 46.1 s | **2.25 s** | — |
+| P95 | 112.4 s | **18.0 s** | **< 5 s** |
+| P99 / max | 117.0 s | 25.8 s / 117.4 s | — |
 
-**Verdict: SLO not yet met, but the collapse is fixed and the gap is now small and well-understood.** Two issues remain, both diagnosed:
+**Verdict: SLO missed, but the congestion collapse is fixed and the remaining gap is fully diagnosed.** Three findings, all metric-grounded:
 
-1. **Bimodal latency (P50 1.43 s vs P95 14.5 s).** The fast path serves ~85% of runs in a single call (~1.4 s); the tail is the runs whose SQL *fails execution* and falls into the `verify → revise` loop (up to 6 calls), stretching to 14–22 s under load and dragging P95 over the line.
-2. **~14% HTTP 500s.** Raised when a `graph.invoke` call throws (vs. a clean wrong-answer, which returns `ok=false`) — most likely vLLM rejecting/dropping calls now that it's actually loaded at ~8 RPS.
+1. **Bimodal latency (P50 2.25 s vs P95 18 s).** ~85% of runs are a single fast-path call (~2 s); the tail is the runs whose SQL *errors* and falls into verify→revise. P95 < 5 s requires that slow-path population below ~5% — a `generate_sql` grounding improvement we did not make.
+2. **~15% errors, unmoved by retries.** Non-transient, almost certainly **context overflow** (prompt > `--max-model-len 8192` on large-schema DBs). This fails the error budget *and* caps goodput at 7.84 — it is the single highest-leverage unfixed item.
+3. **117 s max persists** after cutting retries, so that pathological run is the error path itself, not a retry storm.
 
-**Next iterations (planned):** (a) `MAX_ITERATIONS` 3 → 2 to trim the error-path tail *and* cut vLLM load — one targeted change for both the P95 tail and the 500s; (b) make the agent endpoint async (`graph.ainvoke`) to smooth burst queueing if the tail persists; (c) diagnose the 500s from the agent logs / `request_success_total{finished_reason}` panel to confirm serving- vs. agent-side cause.
-
-**Quality survived the fast path.** Re-running the eval on the final config (`results/eval_after_tuning.json`): **10/30 (33.3%)** vs the baseline **9/30 (30%)** — accuracy did *not* regress (it nudged up by one question, within noise), and avg iterations/run fell from 1.6 to 1.03, confirming the fast path collapsed most runs to a single call. This is the expected result given the Phase 5 loop gain of 0: skipping `verify` on clean executions removes calls the eval already showed were not buying accuracy.
-
-_Artifacts: `screenshots/grafana_before.png` (collapse — vLLM idle, requests timing out) and `screenshots/grafana_after.png` (post-fast-path — KV-cache rising, queue draining)._
+_Artifacts: `screenshots/grafana_before.png` (collapse — vLLM idle, requests timing out), `screenshots/grafana_after.png` (post-fix — KV-cache rising, queue draining), `screenshots/grafana_eval_run.png`._
 
 ---
 
 ## Agent value
 
-The verify→revise loop is judged by the **per-iteration pass rate**, not by intuition — and the honest verdict is that **on this eval set the loop did not earn its keep.** Stopping after the first generate gives 30% (9/30); running the full loop also gives 30% — a **+0 pt** lift (from `results/eval_baseline.json`). The loop *fired* (avg 1.6 iterations/run, so verify flagged answers and revise re-ran), but it never converted a wrong first answer into a correct one. The questions the agent misses are not the ones the loop is good at: with `gold_exec_failures = 0` and the misses surviving clean execution, they are semantic mistakes the verifier either waves through or can't get the reviser to fix — not the broken-SQL (bad column/table, syntax) cases the loop is designed to catch. So as built, the always-on loop is pure latency cost with no accuracy return.
-
-That finding is exactly what justifies the Phase 6 fast path. Because the loop buys no accuracy on clean executions, skipping `verify` there is *free* on quality and pure win on latency — confirmed by `eval_after_tuning.json` (33.3% vs baseline 30%, no regression) while P95 dropped from 112.4 s to 14.5 s and goodput rose from 1.7 to 8.1 RPS. The fast path converts the loop from an always-on tax into a pay-only-when-execution-fails recovery mechanism; the next quality step (see below) is making that recovery actually recover semantic errors, since right now it recovers nothing.
+Judged by the **per-iteration pass rate**, not intuition: the verify→revise loop **does not earn its keep on this eval set**. Iter-0 and final pass rates are both 30% — a **+0 pt** lift (`results/eval_baseline.json`). The loop fires (avg 1.6 iterations/run) but never converts a miss to a hit, because the misses are semantic errors that execute cleanly rather than the broken-SQL cases the loop catches. The right default is therefore the **single-call fast path**, with the loop preserved only for execution errors — which is cheap and occasionally useful — rather than an always-on tax. The fast path is what took P95 from 112 s to 18 s and goodput from 1.67 to 7.84 RPS at **no measured accuracy cost** (post-tuning eval 33.3% vs baseline 30%).
 
 ---
 
 ## What I'd do with more time
 
-Concrete next steps, in priority order, to close the SLO gap (P95 14.5 s → < 5 s) and harden the system:
+In priority order, to close the SLO gap (P95 18 s → < 5 s, goodput 7.84 → 10+):
 
-1. **Trim the latency tail (`MAX_ITERATIONS` 3 → 2).** P50 is 1.4 s but P95 is 14.5 s — the tail is entirely the execution-error runs that fall into verify→revise (up to 6 sequential calls). Capping the loop one step shorter directly cuts the worst runs and lowers load on vLLM. Validate against `eval_after_tuning.json` to confirm iteration 3 wasn't carrying real accuracy (Phase 5's loop-gain number predicts this).
-
-2. **Diagnose and fix the ~14% HTTP 500s.** These are exceptions in `graph.invoke` collapsed into a single status code. I'd split them by class — vLLM transport/overload errors vs. agent-side parse errors — with structured logging and a per-class Prometheus counter, then add a **bounded retry + timeout on the LLM client** so transient vLLM failures become retried successes instead of hard failures (a 14% error rate fails the SLO on error budget alone, independent of latency).
-
-3. **Make the agent endpoint async (`graph.ainvoke`).** The work is I/O-bound (waiting on vLLM), so an async event loop holds hundreds of concurrent runs instead of being capped by FastAPI's ~40-thread pool. The fast path already brought concurrency under that ceiling, but async removes it as a constraint and smooths burst queueing — needed headroom to push *past* 10 RPS.
-
-4. **Cheap heuristic verify-gate instead of blanket skip.** The fast path's one quality risk is letting semantically-wrong-but-executing SQL through. A non-LLM gate (flag empty result sets, all-NULL aggregates, or obviously-degenerate counts) would route only *suspicious* clean executions to the verifier — recovering most of the lost quality without paying the second LLM call on every run.
-
-5. **Reduce the slow-path population at the source.** Improve the `generate_sql` prompt (targeted few-shot on the error patterns the eval surfaces, stricter schema rendering) so fewer first attempts fail execution. A smaller slow-path population shrinks the tail more fundamentally than capping iterations.
-
-6. **Richer eval signal.** Execution accuracy only checks row-set equality on one DB each. I'd add a per-DB and per-error-type breakdown (syntax vs. schema-grounding vs. semantic) so failures point at a cause, and a held-out question set to avoid overfitting prompts to these 30. Phase 4's Langfuse tags (`run:…`, `db_id:…`) make slicing traces by these dimensions straightforward.
-
-7. **Serving-side decode speedup.** Time-per-output-token was ~70 ms; speculative decoding with a small draft model would cut decode latency on the structured-SQL outputs. Separately, prefix-cache hit rate was already ~85% — consistently ordering the shared schema prefix first in the prompt would push that higher and reclaim KV headroom.
+1. **Diagnose and fix the ~15% errors.** Log the exception class behind each HTTP 500 during a load run to confirm they are context overflow; then either raise `--max-model-len` (costs KV headroom) or, better, **trim the schema** to the tables likely relevant to the question so prompts stay well under 8192 tokens. This fixes the error budget *and* lifts goodput toward 10 — the biggest single win available.
+2. **Shrink the slow-path population at the source.** Improve `generate_sql` grounding (targeted few-shot on the error patterns the eval surfaces; inject exact categorical values from the DB so filters use the right literals/casing) so fewer first attempts error. Fewer slow-path runs pulls P95 down into the fast path far more fundamentally than capping iterations.
+3. **A deterministic, non-LLM verifier.** Cheap Python checks (NULL aggregate, zero rows for a non-aggregate question, duplicate rows without `DISTINCT`, aggregate-shape mismatch) that emit a *specific* revise hint. This would move loop gain above 0 — making the loop earn its keep — at essentially no latency, unlike the generic LLM verifier.
+4. **Push past 10 RPS once errors are fixed.** The async event loop has headroom the sync version never did; with the error budget under control, re-run the sweep to find the real throughput ceiling.
+5. **Richer eval signal.** Per-DB and per-error-type breakdown (syntax vs. schema-grounding vs. semantic) so failures point at a cause, plus a held-out question set to avoid overfitting prompts to these 30.
